@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import {
   Map as MapIcon,
   Plus,
@@ -11,7 +13,7 @@ import {
   Loader2,
   Camera,
   Trash2,
-  Route
+  Zap // Icon for Snap mode
 } from 'lucide-react';
 
 // --- Constants ---
@@ -43,12 +45,13 @@ const CATEGORIES = {
 };
 
 export default function AccessMap() {
-  // --- Local State (No Firebase) ---
-  const [segments, setSegments] = useState([]); // Stores data in memory
+  // --- Local State ---
+  const [segments, setSegments] = useState([]);
   const [mapLoaded, setMapLoaded] = useState(false);
 
   // Drawing State
   const [isDrawing, setIsDrawing] = useState(false);
+  const [snapToRoad, setSnapToRoad] = useState(false); // Default to FALSE for stability
   const [isRouting, setIsRouting] = useState(false);
   const [currentPath, setCurrentPath] = useState([]);
   const [showSubmissionForm, setShowSubmissionForm] = useState(false);
@@ -60,8 +63,6 @@ export default function AccessMap() {
   const [selectedCategory, setSelectedCategory] = useState('accessible');
   const [note, setNote] = useState('');
   const [selectedImage, setSelectedImage] = useState(null);
-
-  // Filters
   const [filters, setFilters] = useState({
     accessible: true,
     partial: true,
@@ -76,29 +77,30 @@ export default function AccessMap() {
   const fileInputRef = useRef(null);
   const lastPointRef = useRef(null);
 
-  // --- Routing Logic (OSRM) ---
+  // --- Robust Routing Logic ---
   const fetchRoute = async (start, end) => {
+    if (!snapToRoad) return null; // Skip if disabled
+
     try {
-      // OSRM requires [lon, lat]
       const startCoord = `${start.lng},${start.lat}`;
       const endCoord = `${end.lng},${end.lat}`;
 
+      // Using OSRM public API
       const response = await fetch(
         `https://router.project-osrm.org/route/v1/foot/${startCoord};${endCoord}?overview=full&geometries=geojson`
       );
 
-      if (!response.ok) throw new Error('Network response was not ok');
+      if (!response.ok) return null; // Fail gracefully
 
       const data = await response.json();
 
       if (data.routes && data.routes.length > 0) {
-        // OSRM returns [lon, lat], Leaflet needs [lat, lon]
-        const coordinates = data.routes[0].geometry.coordinates.map(coord => [coord[1], coord[0]]);
-        return coordinates;
+        // Convert [lon, lat] to [lat, lon]
+        return data.routes[0].geometry.coordinates.map(coord => [coord[1], coord[0]]);
       }
       return null;
     } catch (error) {
-      console.error("Routing error:", error);
+      // Silent failure - return null so we fallback to straight line
       return null;
     }
   };
@@ -117,34 +119,14 @@ export default function AccessMap() {
 
   const handleConfirmDelete = () => {
     if (!segmentToDelete) return;
-    // Local delete: Filter out the ID
     setSegments(prev => prev.filter(s => s.id !== segmentToDelete));
     setSegmentToDelete(null);
   };
 
   // --- Leaflet Initialization ---
   useEffect(() => {
-    if (mapLoaded) return;
+    if (mapInstanceRef.current || !mapContainerRef.current) return;
 
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-    document.head.appendChild(link);
-
-    const script = document.createElement('script');
-    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-    script.async = true;
-    script.onload = () => {
-      initMap();
-      setMapLoaded(true);
-    };
-    document.body.appendChild(script);
-  }, []);
-
-  const initMap = () => {
-    if (!mapContainerRef.current || mapInstanceRef.current) return;
-
-    const L = window.L;
     const ITHACA_BOUNDS = [
       [42.35, -76.65],
       [42.55, -76.30]
@@ -164,78 +146,93 @@ export default function AccessMap() {
     drawingLayerRef.current = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;
 
+    // Force a resize to ensure tiles load
+    setTimeout(() => {
+      map.invalidateSize();
+      setMapLoaded(true);
+    }, 100);
+
+    // Robust Click Handler
     map.on('click', (e) => {
-      window.dispatchEvent(new CustomEvent('map-click', { detail: e.latlng }));
+      handleMapClickLogic(e.latlng);
     });
-  };
+
+    return () => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
+    };
+  }, []); // Run once on mount
 
   // --- Map Interaction Logic ---
 
-  // Reset lastPointRef when drawing starts/stops
+  // We use a ref for current state inside the event listener to avoid stale closures
+  const isDrawingRef = useRef(isDrawing);
+  const snapToRoadRef = useRef(snapToRoad);
+
   useEffect(() => {
+    isDrawingRef.current = isDrawing;
+    snapToRoadRef.current = snapToRoad;
+
+    // Reset last point when drawing stops
     if (!isDrawing) {
       lastPointRef.current = null;
+      if (drawingLayerRef.current) drawingLayerRef.current.clearLayers();
     }
-  }, [isDrawing]);
+  }, [isDrawing, snapToRoad]);
 
-  useEffect(() => {
-    const handleMapClick = async (e) => {
-      if (!isDrawing) return;
+  const handleMapClickLogic = async (latlng) => {
+    if (!isDrawingRef.current) return;
 
-      const { lat, lng } = e.detail;
-      const newPoint = [lat, lng];
+    const { lat, lng } = latlng;
+    const newPoint = [lat, lng];
 
-      // If we have a previous point, try to route to the new point
-      if (lastPointRef.current) {
+    // If we have a previous point, try to connect
+    if (lastPointRef.current) {
+      let segmentPoints = null;
+
+      if (snapToRoadRef.current) {
         setIsRouting(true);
-
-        // Use OSRM to find path on street
-        const routePoints = await fetchRoute(
+        // Try routing
+        segmentPoints = await fetchRoute(
           { lat: lastPointRef.current[0], lng: lastPointRef.current[1] },
           { lat, lng }
         );
-
         setIsRouting(false);
+      }
 
-        if (routePoints) {
-          // Success: Add the snapped geometry
-          setCurrentPath(prev => [...prev, ...routePoints]);
-          lastPointRef.current = routePoints[routePoints.length - 1];
-        } else {
-          // Fallback: Straight line
-          setCurrentPath(prev => [...prev, newPoint]);
-          lastPointRef.current = newPoint;
-        }
+      if (segmentPoints) {
+        // Routing success
+        setCurrentPath(prev => [...prev, ...segmentPoints]);
+        lastPointRef.current = segmentPoints[segmentPoints.length - 1];
       } else {
-        // First point
+        // Fallback: Straight line (ALWAYS works)
         setCurrentPath(prev => [...prev, newPoint]);
         lastPointRef.current = newPoint;
       }
-    };
-
-    window.addEventListener('map-click', handleMapClick);
-    return () => window.removeEventListener('map-click', handleMapClick);
-  }, [isDrawing]);
+    } else {
+      // First point
+      setCurrentPath([newPoint]);
+      lastPointRef.current = newPoint;
+    }
+  };
 
   // Update Cursor
   useEffect(() => {
     if (!mapInstanceRef.current) return;
     const container = mapInstanceRef.current.getContainer();
-    if (isRouting) {
-      container.style.cursor = 'wait';
-    } else {
-      container.style.cursor = isDrawing ? 'crosshair' : 'grab';
-    }
-  }, [isDrawing, isRouting, mapLoaded]);
+    container.style.cursor = isRouting ? 'wait' : (isDrawing ? 'crosshair' : 'grab');
+  }, [isDrawing, isRouting]);
 
   // Render Drawing Path
   useEffect(() => {
-    if (!mapInstanceRef.current || !drawingLayerRef.current || !window.L) return;
+    if (!mapInstanceRef.current || !drawingLayerRef.current) return;
 
     drawingLayerRef.current.clearLayers();
 
     if (currentPath.length > 0) {
-      const L = window.L;
+      // Draw the line
       L.polyline(currentPath, {
         color: '#3b82f6',
         dashArray: '10, 10',
@@ -243,19 +240,18 @@ export default function AccessMap() {
         opacity: 0.7
       }).addTo(drawingLayerRef.current);
 
-      // Dots for vertices (Only show start/end)
-      if (currentPath.length > 0) {
-        L.circleMarker(currentPath[0], { radius: 4, color: '#3b82f6', fillOpacity: 1, fillColor: '#fff' }).addTo(drawingLayerRef.current);
-        L.circleMarker(currentPath[currentPath.length - 1], { radius: 4, color: '#3b82f6', fillOpacity: 1, fillColor: '#fff' }).addTo(drawingLayerRef.current);
+      // Draw Start/End dots
+      L.circleMarker(currentPath[0], { radius: 5, color: '#3b82f6', fillOpacity: 1, fillColor: '#fff' }).addTo(drawingLayerRef.current);
+      if (currentPath.length > 1) {
+        L.circleMarker(currentPath[currentPath.length - 1], { radius: 5, color: '#3b82f6', fillOpacity: 1, fillColor: '#fff' }).addTo(drawingLayerRef.current);
       }
     }
-  }, [currentPath, mapLoaded]);
+  }, [currentPath]);
 
   // Render Existing Segments
   useEffect(() => {
-    if (!mapInstanceRef.current || !segmentsLayerRef.current || !window.L) return;
+    if (!mapInstanceRef.current || !segmentsLayerRef.current) return;
 
-    const L = window.L;
     segmentsLayerRef.current.clearLayers();
 
     segments.forEach(seg => {
@@ -297,7 +293,7 @@ export default function AccessMap() {
                 class="group flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-red-600 hover:bg-red-50 px-2 py-1.5 rounded-md transition-all cursor-pointer"
                 title="Delete this path"
               >
-                <svg class="w-3.5 h-3.5 transition-transform group-hover:scale-110" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+                <svg style="width:14px;height:14px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
                 Delete
               </button>
             </div>
@@ -309,7 +305,7 @@ export default function AccessMap() {
       polyline.bindPopup(popupContent, { className: 'custom-popup-clean', minWidth: 240, maxWidth: 300 });
       polyline.addTo(segmentsLayerRef.current);
     });
-  }, [segments, filters, mapLoaded]);
+  }, [segments, filters]);
 
   // --- Action Handlers ---
 
@@ -330,7 +326,10 @@ export default function AccessMap() {
   };
 
   const finishDrawing = () => {
-    if (currentPath.length < 2) return;
+    if (currentPath.length < 2) {
+      alert("Please draw at least 2 points");
+      return;
+    }
     setIsDrawing(false);
     setShowSubmissionForm(true);
   };
@@ -370,25 +369,23 @@ export default function AccessMap() {
   };
 
   const submitSegment = () => {
-    // Create new segment object
     const newSegment = {
-      id: Date.now().toString(), // Simple local ID
-      path: currentPath,
+      id: Date.now().toString(),
+      path: [...currentPath], // Create a copy
       category: selectedCategory,
       note: note,
       image: selectedImage,
       createdAt: new Date()
     };
 
-    // Update local state
     setSegments(prev => [...prev, newSegment]);
 
-    // Reset Form
     setShowSubmissionForm(false);
     setCurrentPath([]);
     setNote('');
     setSelectedImage(null);
     setSelectedCategory('accessible');
+    lastPointRef.current = null;
   };
 
   const toggleFilter = (key) => {
@@ -406,7 +403,7 @@ export default function AccessMap() {
           </div>
           <div>
             <h1 className="font-bold text-lg leading-tight text-slate-800">AccessMap Ithaca</h1>
-            <p className="text-xs text-slate-500">Local Prototype (No Sync)</p>
+            <p className="text-xs text-slate-500">Local Prototype</p>
           </div>
         </div>
 
@@ -422,9 +419,21 @@ export default function AccessMap() {
           )}
           {isDrawing && (
             <div className="flex items-center gap-2 animate-in fade-in slide-in-from-right-4">
-              <span className="text-xs font-medium text-slate-500 mr-2 hidden sm:inline">
-                {isRouting ? 'Snapping to street...' : 'Click map to trace path'}
+
+              {/* Snap Toggle */}
+              <button
+                onClick={() => setSnapToRoad(!snapToRoad)}
+                className={`flex items-center gap-1 px-3 py-2 rounded-full text-xs font-medium border ${snapToRoad ? 'bg-indigo-100 text-indigo-700 border-indigo-200' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                  }`}
+              >
+                <Zap size={14} className={snapToRoad ? "fill-indigo-700" : ""} />
+                {snapToRoad ? 'Snap ON' : 'Snap OFF'}
+              </button>
+
+              <span className="text-xs font-medium text-slate-500 mx-2 hidden sm:inline w-24 text-center">
+                {isRouting ? 'Snapping...' : 'Click to draw'}
               </span>
+
               <button
                 onClick={finishDrawing}
                 className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-full text-sm font-medium shadow-sm"
@@ -447,9 +456,9 @@ export default function AccessMap() {
       {/* Main Map Container */}
       <div className="flex-1 relative isolate bg-slate-200">
         {isRouting && (
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[1100] bg-white/90 backdrop-blur px-4 py-3 rounded-full shadow-xl flex items-center gap-3">
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[1100] bg-white/90 backdrop-blur px-4 py-3 rounded-full shadow-xl flex items-center gap-3 pointer-events-none">
             <Loader2 className="animate-spin text-blue-600" size={20} />
-            <span className="text-sm font-medium text-slate-700">Snapping to street...</span>
+            <span className="text-sm font-medium text-slate-700">Snapping...</span>
           </div>
         )}
 
