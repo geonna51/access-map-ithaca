@@ -46,8 +46,25 @@ const CATEGORIES = {
 
 export default function AccessMap() {
   // --- Local State ---
-  const [segments, setSegments] = useState([]);
+  const [segments, setSegments] = useState(() => {
+    try {
+      const saved = localStorage.getItem('access-map-data');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      console.error("Failed to load from localStorage", e);
+      return [];
+    }
+  });
   const [mapLoaded, setMapLoaded] = useState(false);
+
+  // Persistence Effect
+  useEffect(() => {
+    try {
+      localStorage.setItem('access-map-data', JSON.stringify(segments));
+    } catch (e) {
+      console.error("Failed to save to localStorage", e);
+    }
+  }, [segments]);
 
   // Drawing State
   const [isDrawing, setIsDrawing] = useState(false);
