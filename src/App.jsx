@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import {
-  Map as MapIcon,
+
   Plus,
   Check,
   X,
@@ -414,13 +414,16 @@ export default function AccessMap() {
 
       {/* Header */}
       <header className="bg-white shadow-sm z-20 px-4 py-3 flex items-center justify-between shrink-0 border-b border-slate-200">
-        <div className="flex items-center gap-2">
-          <div className="bg-blue-600 p-2 rounded-lg text-white">
-            <MapIcon size={20} />
+        <div className="flex items-center gap-3">
+          <div className="bg-[#B31B1B] w-10 h-10 rounded-lg flex items-center justify-center text-white shadow-sm">
+            <span className="font-serif font-bold text-2xl leading-none pt-1">C</span>
           </div>
           <div>
-            <h1 className="font-bold text-lg leading-tight text-slate-800">AccessMap Ithaca</h1>
-            <p className="text-xs text-slate-500">Local Prototype</p>
+            <h1 className="font-bold text-lg leading-tight text-slate-900">AccessMap Ithaca</h1>
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#B31B1B]"></span>
+              <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">Cornell University</p>
+            </div>
           </div>
         </div>
 
